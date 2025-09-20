@@ -61,21 +61,55 @@ class AdvancedEMAStrategy(bt.Strategy):
                 self.order = self.sell()
 
 # ------------------------------
-# 3. Performance Analyzer
+# 3. Performance Metrics Analyzer
 # ------------------------------
-class PerformanceAnalyzer(bt.Analyzer):
+class MetricsAnalyzer(bt.Analyzer):
+    def __init__(self):
+        self.start_value = None
+        self.end_value = None
+        self.returns = []
+
+    def start(self):
+        self.start_value = self.strategy.broker.getvalue()
+
+    def next(self):
+        value = self.strategy.broker.getvalue()
+        if self.end_value is None:
+            self.end_value = value
+        self.returns.append(value)
+
+    def stop(self):
+        self.end_value = self.strategy.broker.getvalue()
+        self.rets = pd.Series(self.returns).pct_change().dropna()
+        
+        # CAGR
+        years = (self.strategy.datas[0].datetime.date(-1) - self.strategy.datas[0].datetime.date(0)).days / 365.25
+        self.cagr = (self.end_value / self.start_value) ** (1 / years) - 1
+
+        # Sharpe Ratio (assuming 0% risk-free rate)
+        self.sharpe = np.mean(self.rets) / np.std(self.rets) * np.sqrt(252) if np.std(self.rets) != 0 else 0
+
+        # Max Drawdown
+        cumulative = (1 + self.rets).cumprod()
+        peak = cumulative.cummax()
+        drawdown = (cumulative - peak) / peak
+        self.max_dd = drawdown.min()
+
     def get_analysis(self):
-        portfolio = self.strategy.broker.get_value()
-        cash = self.strategy.broker.get_cash()
-        pnl = portfolio - 100000  # assuming initial cash 100k
-        return dict(portfolio=portfolio, cash=cash, pnl=pnl)
+        return dict(
+            start_value=self.start_value,
+            end_value=self.end_value,
+            cagr=self.cagr,
+            sharpe=self.sharpe,
+            max_drawdown=self.max_dd
+        )
 
 # ------------------------------
 # 4. Backtest Setup
 # ------------------------------
 cerebro = bt.Cerebro()
 cerebro.addstrategy(AdvancedEMAStrategy)
-cerebro.addanalyzer(PerformanceAnalyzer, _name="perf")
+cerebro.addanalyzer(MetricsAnalyzer, _name="metrics")
 
 # Initial capital and commission
 cerebro.broker.setcash(100000.0)
@@ -89,12 +123,15 @@ for ticker in tickers:
 
 # Run backtest
 results = cerebro.run()
-analyzer = results[0].analyzers.perf.get_analysis()
+analyzer = results[0].analyzers.metrics.get_analysis()
 
 # ------------------------------
 # 5. Print & Plot Results
 # ------------------------------
-print(f"Final Portfolio Value: {analyzer['portfolio']:.2f}")
-print(f"Total PnL: {analyzer['pnl']:.2f}")
+print(f"Initial Portfolio Value: {analyzer['start_value']:.2f}")
+print(f"Final Portfolio Value: {analyzer['end_value']:.2f}")
+print(f"CAGR: {analyzer['cagr']*100:.2f}%")
+print(f"Sharpe Ratio: {analyzer['sharpe']:.2f}")
+print(f"Max Drawdown: {analyzer['max_drawdown']*100:.2f}%")
 
 cerebro.plot(iplot=False, style="candlestick")
