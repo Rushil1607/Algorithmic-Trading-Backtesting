@@ -1,8 +1,6 @@
 import pandas as pd
 import yfinance as yf
 import backtrader as bt
-import datetime as dt
-import numpy as np
 
 # ------------------------------
 # 1. Download Historical Data
@@ -11,13 +9,22 @@ tickers = ["AAPL", "MSFT"]  # example portfolio
 start_date = "2020-01-01"
 end_date = "2024-12-31"
 
-dfs = []
+data_dict = {}
 for ticker in tickers:
     df = yf.download(ticker, start=start_date, end=end_date)
-    df["Ticker"] = ticker
-    dfs.append(df)
 
-data = pd.concat(dfs)
+    # Flatten MultiIndex columns if they exist
+    df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
+
+    # Keep only available OHLCV columns (Adj Close optional)
+    keep_cols = [col for col in ['Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close'] if col in df.columns]
+    df = df[keep_cols]
+
+    # Ensure datetime index
+    df.index = pd.to_datetime(df.index)
+
+    # Save cleaned DataFrame
+    data_dict[ticker] = df
 
 # ------------------------------
 # 2. Define Strategy
@@ -33,7 +40,6 @@ class AdvancedEMAStrategy(bt.Strategy):
     )
 
     def __init__(self):
-        # Indicators
         self.short_ema = bt.indicators.EMA(self.data.close, period=self.p.short_period)
         self.long_ema = bt.indicators.EMA(self.data.close, period=self.p.long_period)
         self.rsi = bt.indicators.RSI_SMA(self.data.close, period=self.p.rsi_period)
@@ -61,77 +67,56 @@ class AdvancedEMAStrategy(bt.Strategy):
                 self.order = self.sell()
 
 # ------------------------------
-# 3. Performance Metrics Analyzer
+# 3. Performance Analyzer
 # ------------------------------
-class MetricsAnalyzer(bt.Analyzer):
-    def __init__(self):
-        self.start_value = None
-        self.end_value = None
-        self.returns = []
-
-    def start(self):
-        self.start_value = self.strategy.broker.getvalue()
-
-    def next(self):
-        value = self.strategy.broker.getvalue()
-        if self.end_value is None:
-            self.end_value = value
-        self.returns.append(value)
-
-    def stop(self):
-        self.end_value = self.strategy.broker.getvalue()
-        self.rets = pd.Series(self.returns).pct_change().dropna()
-        
-        # CAGR
-        years = (self.strategy.datas[0].datetime.date(-1) - self.strategy.datas[0].datetime.date(0)).days / 365.25
-        self.cagr = (self.end_value / self.start_value) ** (1 / years) - 1
-
-        # Sharpe Ratio (assuming 0% risk-free rate)
-        self.sharpe = np.mean(self.rets) / np.std(self.rets) * np.sqrt(252) if np.std(self.rets) != 0 else 0
-
-        # Max Drawdown
-        cumulative = (1 + self.rets).cumprod()
-        peak = cumulative.cummax()
-        drawdown = (cumulative - peak) / peak
-        self.max_dd = drawdown.min()
-
+class PerformanceAnalyzer(bt.Analyzer):
     def get_analysis(self):
-        return dict(
-            start_value=self.start_value,
-            end_value=self.end_value,
-            cagr=self.cagr,
-            sharpe=self.sharpe,
-            max_drawdown=self.max_dd
-        )
+        portfolio = self.strategy.broker.get_value()
+        cash = self.strategy.broker.get_cash()
+        pnl = portfolio - 100000  # assuming initial cash 100k
+        return dict(portfolio=portfolio, cash=cash, pnl=pnl)
 
 # ------------------------------
 # 4. Backtest Setup
 # ------------------------------
 cerebro = bt.Cerebro()
 cerebro.addstrategy(AdvancedEMAStrategy)
-cerebro.addanalyzer(MetricsAnalyzer, _name="metrics")
+
+# Add analyzers for performance metrics
+cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name="sharpe", timeframe=bt.TimeFrame.Days, riskfreerate=0.0)
+cerebro.addanalyzer(bt.analyzers.DrawDown, _name="drawdown")
+cerebro.addanalyzer(bt.analyzers.AnnualReturn, _name="annualreturn")
+cerebro.addanalyzer(bt.analyzers.Returns, _name="returns")
 
 # Initial capital and commission
 cerebro.broker.setcash(100000.0)
 cerebro.broker.setcommission(commission=0.001)  # 0.1% commission
 
-# Add data for each ticker
-for ticker in tickers:
-    df = data[data["Ticker"] == ticker]
+# Add cleaned data for each ticker
+for ticker, df in data_dict.items():
     df_bt = bt.feeds.PandasData(dataname=df)
     cerebro.adddata(df_bt, name=ticker)
 
 # Run backtest
 results = cerebro.run()
-analyzer = results[0].analyzers.metrics.get_analysis()
+strat = results[0]
 
 # ------------------------------
-# 5. Print & Plot Results
+# 5. Print Results
 # ------------------------------
-print(f"Initial Portfolio Value: {analyzer['start_value']:.2f}")
-print(f"Final Portfolio Value: {analyzer['end_value']:.2f}")
-print(f"CAGR: {analyzer['cagr']*100:.2f}%")
-print(f"Sharpe Ratio: {analyzer['sharpe']:.2f}")
-print(f"Max Drawdown: {analyzer['max_drawdown']*100:.2f}%")
+start_value = 100000.0
+end_value = cerebro.broker.getvalue()
+cagr = strat.analyzers.returns.get_analysis()["rnorm100"]
+sharpe = strat.analyzers.sharpe.get_analysis().get("sharperatio", None)
+max_dd = strat.analyzers.drawdown.get_analysis()["max"]["drawdown"]
 
+print(f"Initial Portfolio Value: {start_value:.2f}")
+print(f"Final Portfolio Value: {end_value:.2f}")
+print(f"CAGR: {cagr:.2f}%")
+print(f"Sharpe Ratio: {sharpe:.2f}")
+print(f"Max Drawdown: {max_dd:.2f}%")
+
+# ------------------------------
+# 6. Plot
+# ------------------------------
 cerebro.plot(iplot=False, style="candlestick")
